@@ -198,7 +198,7 @@ notify() {
     local title="$1"
     local message="$2"
     if command -v osascript >/dev/null 2>&1; then
-        osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null || true
+        osascript -e "display notification \"$message\" with title \"$title\" subtitle \"⚙️\"" 2>/dev/null || true
     fi
 }
 

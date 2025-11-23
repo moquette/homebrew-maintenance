@@ -29,7 +29,21 @@ A comprehensive shell script for automated Homebrew package management, system m
 
 ## Installation
 
-### Quick Setup
+### Quick Install with Curl
+
+```bash
+# Download and run directly
+curl -sL https://raw.githubusercontent.com/moquette/homebrew-maintenance/main/maintenance | zsh
+
+# Or download to current directory
+curl -sL https://raw.githubusercontent.com/moquette/homebrew-maintenance/main/maintenance -o homebrew-maintenance && chmod +x homebrew-maintenance && echo "✓ Saved to: $(pwd)/homebrew-maintenance"
+
+# Then move it wherever you prefer (e.g., ~/bin, /usr/local/bin, etc.)
+mv homebrew-maintenance ~/bin/  # or any other location
+```
+
+### Clone Setup
+
 ```bash
 # Clone or download to your preferred location
 git clone https://github.com/moquette/homebrew-maintenance ~/bin/homebrew-maintenance
@@ -43,6 +57,7 @@ ln -s "$PWD/maintenance" /usr/local/bin/maintenance
 ```
 
 ### Verify Installation
+
 ```bash
 ./maintenance --help
 ```

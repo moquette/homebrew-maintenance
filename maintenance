@@ -1,0 +1,518 @@
+#!/bin/zsh
+# Homebrew Maintenance
+# Handles package updates, cleanup, and health checks
+
+set -euo pipefail
+
+# Initialize counters and flags
+TASKS_SUCCESSFUL=0
+TASKS_FAILED=0
+TASKS_SKIPPED=0
+START_TIME=$(date +%s)
+VERBOSE=false
+DRY_RUN=${DRY_RUN:-false}
+SKIP_UPDATE=false
+SKIP_UPGRADE=false
+SKIP_CASK=false
+SKIP_CLEANUP=false
+SKIP_DOCTOR=false
+SKIP_TAPS=false
+SKIP_LINKS=false
+SKIP_PERMISSIONS=true
+SKIP_PRUNE=false
+
+# Parse command-line flags
+parse_flags() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --update-only)
+                SKIP_UPGRADE=true
+                SKIP_CASK=true
+                SKIP_CLEANUP=true
+                SKIP_DOCTOR=true
+                shift
+                ;;
+            --upgrade-only)
+                SKIP_CLEANUP=true
+                SKIP_DOCTOR=true
+                shift
+                ;;
+            --cleanup-only)
+                SKIP_UPDATE=true
+                SKIP_UPGRADE=true
+                SKIP_CASK=true
+                SKIP_DOCTOR=true
+                shift
+                ;;
+            --skip-cask)
+                SKIP_CASK=true
+                shift
+                ;;
+            --skip-cleanup)
+                SKIP_CLEANUP=true
+                shift
+                ;;
+            --skip-doctor)
+                SKIP_DOCTOR=true
+                shift
+                ;;
+            --skip-taps)
+                SKIP_TAPS=true
+                shift
+                ;;
+            --skip-links)
+                SKIP_LINKS=true
+                shift
+                ;;
+            --repair-permissions)
+                SKIP_PERMISSIONS=false
+                shift
+                ;;
+            --skip-prune)
+                SKIP_PRUNE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown flag: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Show help message
+show_help() {
+    cat << EOF
+Homebrew Maintenance
+
+Usage: $(basename "$0") [options]
+
+Options:
+  -v, --verbose           Show detailed output
+  -n, --dry-run           Preview changes without executing
+  --update-only           Only update Homebrew formulae
+  --upgrade-only          Only upgrade packages (skip cleanup)
+  --cleanup-only          Only perform cleanup operations
+  --skip-cask             Skip cask upgrades
+  --skip-cleanup          Skip cleanup operations
+  --skip-doctor           Skip brew doctor checks
+  --skip-taps             Skip tap updates
+  --skip-links            Skip symlink checks
+  --repair-permissions    Repair Homebrew permissions (requires sudo)
+  --skip-prune            Skip git pruning
+  -h, --help              Show this help message
+
+Examples:
+  ./maintenance                    # Full maintenance
+  ./maintenance -v                 # Verbose mode
+  ./maintenance -n                 # Preview changes
+  ./maintenance --upgrade-only     # Update packages only
+  ./maintenance --cleanup-only     # Cleanup only
+EOF
+}
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Trap errors and signals
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        error "Script interrupted or failed with exit code $exit_code"
+    fi
+    exit $exit_code
+}
+
+trap cleanup EXIT INT TERM
+
+# Logging functions
+error() {
+    echo "${RED}✗ ERROR: $@${NC}" >&2
+}
+
+success() {
+    echo "${GREEN}✓ $@${NC}"
+}
+
+warning() {
+    echo "${YELLOW}⚠ WARNING: $@${NC}"
+}
+
+info() {
+    echo "${CYAN}ℹ $@${NC}"
+}
+
+progress() {
+    echo "${BLUE}→ $@${NC}"
+}
+
+debug() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "${BLUE}◆ DEBUG: $@${NC}"
+    fi
+}
+
+subheader() {
+    echo ""
+    echo "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo "${CYAN}$@${NC}"
+    echo "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+indent() {
+    sed 's/^/  /'
+}
+
+# Get elapsed time
+get_elapsed_time() {
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - START_TIME))
+    if [[ $elapsed -lt 60 ]]; then
+        echo "${elapsed}s"
+    else
+        echo "$((elapsed / 60))m $((elapsed % 60))s"
+    fi
+}
+
+# Send system notification
+notify() {
+    local title="$1"
+    local message="$2"
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null || true
+    fi
+}
+
+# Check and fix symlinks
+check_symlinks() {
+    debug "Checking for broken symlinks..."
+    local broken_count=$(find "$(brew --prefix)/opt" -type l ! -exec test -e {} \; -print 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [[ $broken_count -gt 0 ]]; then
+        warning "Found ${broken_count} broken symlink(s)"
+        if [[ "$DRY_RUN" != "true" ]]; then
+            debug "Attempting to repair symlinks"
+            find "$(brew --prefix)/opt" -type l ! -exec test -e {} \; -delete 2>/dev/null || true
+            TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        else
+            TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+        fi
+    else
+        success "All symlinks are valid"
+        TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+    fi
+}
+
+# Update all taps
+update_taps() {
+    debug "Checking taps..."
+    local tap_count=$(brew tap 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [[ $tap_count -gt 0 ]]; then
+        info "Found ${tap_count} tap(s)"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "[dry-run] Would update all taps"
+            TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+        else
+            run_task "Updating taps" brew tap --repair || warning "Tap update encountered issues"
+        fi
+    else
+        info "No taps installed"
+        TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+    fi
+}
+
+# Repair permissions
+repair_permissions() {
+    debug "Checking permissions..."
+    local brew_prefix=$(brew --prefix)
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[dry-run] Would repair Homebrew permissions at $brew_prefix"
+        TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+    else
+        progress "Repairing Homebrew permissions"
+        if sudo chown -R "$(whoami)" "$brew_prefix/bin" "$brew_prefix/etc" "$brew_prefix/lib" "$brew_prefix/sbin" 2>/dev/null; then
+            success "Permissions repaired"
+            TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        else
+            warning "Permission repair encountered issues (may need sudo)"
+            TASKS_FAILED=$((TASKS_FAILED + 1))
+        fi
+    fi
+}
+
+# Prune git history
+prune_git() {
+    debug "Checking Homebrew git repositories..."
+    local brew_prefix=$(brew --prefix)
+    local git_size_before=$(du -sh "$brew_prefix/.git" 2>/dev/null | cut -f1)
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[dry-run] Would prune git history (current size: ${git_size_before:-unknown})"
+        TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+    else
+        progress "Pruning Homebrew git history"
+        if cd "$brew_prefix" && git gc --aggressive 2>/dev/null; then
+            local git_size_after=$(du -sh "$brew_prefix/.git" 2>/dev/null | cut -f1)
+            success "Git history pruned (${git_size_before:-?} → ${git_size_after:-?})"
+            TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        else
+            warning "Git pruning encountered issues"
+            TASKS_FAILED=$((TASKS_FAILED + 1))
+        fi
+    fi
+}
+
+# Show disk usage
+show_disk_usage() {
+    debug "Calculating Homebrew disk usage..."
+    local brew_prefix=$(brew --prefix)
+    local cellar_size=$(du -sh "$brew_prefix/Cellar" 2>/dev/null | cut -f1)
+    local cache_size=$(du -sh ~/Library/Caches/Homebrew 2>/dev/null | cut -f1)
+    local git_size=$(du -sh "$brew_prefix/.git" 2>/dev/null | cut -f1)
+    
+    info "Homebrew disk usage:"
+    info "  Cellar: ${cellar_size:-unknown}"
+    info "  Cache: ${cache_size:-unknown}"
+    info "  Git: ${git_size:-unknown}"
+    TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+}
+
+# Task execution wrapper with timing
+run_task() {
+    local description="$1"
+    shift
+    local task_start=$(date +%s)
+    
+    progress "$description"
+    
+    if "$@" 2>&1; then
+        local task_end=$(date +%s)
+        local duration=$((task_end - task_start))
+        success "$description completed (${duration}s)"
+        TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        return 0
+    else
+        local task_end=$(date +%s)
+        local duration=$((task_end - task_start))
+        error "$description failed (${duration}s)"
+        TASKS_FAILED=$((TASKS_FAILED + 1))
+        return 1
+    fi
+}
+
+run_homebrew_maintenance() {
+    subheader "🍺 Homebrew maintenance"
+    
+    if [[ "$VERBOSE" == "true" ]]; then
+        debug "Verbose mode enabled"
+        debug "DRY_RUN: $DRY_RUN"
+        debug "SKIP_UPDATE: $SKIP_UPDATE"
+        debug "SKIP_UPGRADE: $SKIP_UPGRADE"
+        debug "SKIP_CASK: $SKIP_CASK"
+        debug "SKIP_CLEANUP: $SKIP_CLEANUP"
+        debug "SKIP_DOCTOR: $SKIP_DOCTOR"
+        echo
+    fi
+
+    # Check Homebrew availability
+    if ! command -v brew >/dev/null 2>&1; then
+        error "Homebrew not installed or not in PATH"
+        notify "Homebrew Maintenance" "Failed: Homebrew not installed"
+        return 1
+    fi
+    
+    debug "Homebrew found at: $(which brew)"
+    
+    # Update Homebrew
+    if [[ "$SKIP_UPDATE" != "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "[dry-run] Would update Homebrew"
+            TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+        else
+            run_task "Updating Homebrew formulae" brew update || return 1
+        fi
+    else
+        debug "Skipping Homebrew update"
+    fi
+    
+    # Check for outdated packages
+    if [[ "$SKIP_UPGRADE" != "true" ]]; then
+        local outdated_count=$(brew outdated --quiet 2>/dev/null | wc -l | tr -d ' ')
+        if [[ $outdated_count -gt 0 ]]; then
+            info "Found ${outdated_count} outdated formulae"
+            
+            if [[ "$VERBOSE" == "true" ]]; then
+                info "Outdated formulae:"
+                brew outdated --verbose 2>/dev/null | indent
+            fi
+            
+            if [[ "$DRY_RUN" == "true" ]]; then
+                info "[dry-run] Would upgrade $outdated_count package(s)"
+                TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+            else
+                run_task "Upgrading formulae" brew upgrade || warning "Some packages failed to upgrade"
+            fi
+        else
+            success "All formulae up to date"
+            TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        fi
+    else
+        debug "Skipping package upgrades"
+    fi
+    
+    # Check for outdated casks
+    if [[ "$SKIP_CASK" != "true" ]] && command -v brew >/dev/null 2>&1 && brew tap 2>/dev/null | grep -q cask; then
+        local outdated_casks=$(brew outdated --cask --quiet 2>/dev/null | wc -l | tr -d ' ')
+        if [[ $outdated_casks -gt 0 ]]; then
+            info "Found ${outdated_casks} outdated cask(s)"
+            
+            if [[ "$VERBOSE" == "true" ]]; then
+                info "Outdated casks:"
+                brew outdated --cask --verbose 2>/dev/null | indent
+            fi
+            
+            if [[ "$DRY_RUN" == "true" ]]; then
+                info "[dry-run] Would upgrade $outdated_casks cask(s)"
+                TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+            else
+                run_task "Upgrading casks" brew upgrade --cask || warning "Some casks failed to upgrade"
+            fi
+        else
+            success "All casks up to date"
+            TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        fi
+    else
+        debug "Skipping cask upgrades"
+    fi
+    
+    # Remove orphaned dependencies
+    if [[ "$SKIP_CLEANUP" != "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "[dry-run] Would remove orphaned dependencies"
+            TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+        else
+            run_task "Removing orphaned dependencies" brew autoremove || warning "Autoremove encountered issues"
+        fi
+    else
+        debug "Skipping orphaned dependency removal"
+    fi
+
+    # Clean up old versions
+    if [[ "$SKIP_CLEANUP" != "true" ]]; then
+        local cleanup_size=$(brew cleanup -n 2>/dev/null | grep "Would remove:" | cut -d: -f2 | xargs)
+        if [[ -n "$cleanup_size" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                info "[dry-run] Would clean ${cleanup_size} from cache"
+                TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+            else
+                run_task "Cleaning Homebrew cache (${cleanup_size})" brew cleanup || warning "Cleanup encountered issues"
+            fi
+        else
+            info "Homebrew cache already clean"
+            TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+        fi
+    else
+        debug "Skipping cache cleanup"
+    fi
+
+    # Run brew doctor for health check
+    if [[ "$SKIP_DOCTOR" != "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "[dry-run] Would run brew doctor health check"
+            TASKS_SKIPPED=$((TASKS_SKIPPED + 1))
+        else
+            progress "Running brew doctor health check"
+            local doctor_output=$(brew doctor 2>&1 || true)
+
+            if [[ "$doctor_output" == *"ready to brew"* ]]; then
+                success "Homebrew is ready to brew"
+                TASKS_SUCCESSFUL=$((TASKS_SUCCESSFUL + 1))
+            else
+                warning "Homebrew has some issues"
+                echo "$doctor_output" | grep -v "Please note that these warnings" | indent
+                info "Run 'brew doctor' for full details"
+                TASKS_FAILED=$((TASKS_FAILED + 1))
+            fi
+        fi
+    else
+        debug "Skipping brew doctor check"
+    fi
+    
+    # Update taps
+    if [[ "$SKIP_TAPS" != "true" ]]; then
+        echo
+        update_taps
+    else
+        debug "Skipping tap updates"
+    fi
+    
+    # Check symlinks
+    if [[ "$SKIP_LINKS" != "true" ]]; then
+        echo
+        progress "Checking symlinks"
+        check_symlinks
+    else
+        debug "Skipping symlink checks"
+    fi
+    
+    # Show disk usage
+    echo
+    progress "Disk usage report"
+    show_disk_usage
+    
+    # Repair permissions
+    if [[ "$SKIP_PERMISSIONS" != "true" ]]; then
+        echo
+        repair_permissions
+    else
+        debug "Skipping permission repairs"
+    fi
+    
+    # Prune git
+    if [[ "$SKIP_PRUNE" != "true" ]]; then
+        echo
+        prune_git
+    else
+        debug "Skipping git pruning"
+    fi
+    
+    # Print summary with elapsed time
+    echo
+    local elapsed=$(get_elapsed_time)
+    subheader "Summary (${elapsed})"
+    info "Successful tasks: ${TASKS_SUCCESSFUL}"
+    info "Failed tasks: ${TASKS_FAILED}"
+    info "Skipped tasks: ${TASKS_SKIPPED}"
+    
+    # Send completion notification
+    if [[ $TASKS_FAILED -eq 0 ]]; then
+        notify "Homebrew Maintenance" "✓ Completed successfully in ${elapsed}"
+    else
+        notify "Homebrew Maintenance" "⚠ Completed with ${TASKS_FAILED} failures"
+    fi
+}
+
+# Run maintenance
+parse_flags "$@"
+run_homebrew_maintenance
